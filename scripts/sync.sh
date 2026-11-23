@@ -41,6 +41,8 @@ git rev-parse --quiet --verify "refs/heads/patched/v$previous" >/dev/null ||
     fail "There is no patched/v$previous to take the patch from."
 
 work=$(mktemp -d)
+# Anything else that fails says where it stopped and what it left.
+trap 'echo "Stopped at: $BASH_COMMAND. Work so far is in $work; nothing was pushed." >&2' ERR
 
 # 1. The release, checked before anything changes.
 checksum=$(curl -fsSL -A "$agent" "https://crates.io/api/v1/crates/$crate/$version" | jq -er .version.checksum)
