@@ -581,7 +581,7 @@ impl WaylandClientState {
         self.coast_window = None;
     }
 
-    // Ritornel: a click or a pinch ends a coast.
+    // Ritornel: a click, a pinch or a mouse wheel ends a coast.
     fn end_coast(&mut self) {
         self.kinetic.end();
         self.coast_window = None;
@@ -2819,8 +2819,11 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandClientStatePtr {
                     // Ended, as on macOS, and coasts after it ends, as its
                     // momentum does there.
                     let stop_time = state.axis_stop_time.take();
-                    if continuous.is_some() || discrete.is_some() {
+                    // Fingers catch a coast; a mouse wheel ends it.
+                    if finger_time.is_some() {
                         state.catch_coast();
+                    } else if continuous.is_some() || discrete.is_some() {
+                        state.end_coast();
                     }
                     let mut deltas = Vec::new();
                     if let Some(continuous) = continuous {

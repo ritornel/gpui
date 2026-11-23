@@ -146,11 +146,13 @@ impl Kinetic {
         }
     }
 
-    /// A click or a pinch ends the coast: it stops, and a later flick may
-    /// add the speed it would have slowed to by then.
+    /// A click, a pinch or a mouse wheel ends the coast: it stops, and a
+    /// later flick may add the speed it would have slowed to by then. A
+    /// coast fingers caught and kept is forgotten.
     pub(crate) fn end(&mut self) {
-        if let Some(coast) = self.coast.take() {
-            self.stopped = Some(Stopped::Ended(coast));
+        match self.coast.take() {
+            Some(coast) => self.stopped = Some(Stopped::Ended(coast)),
+            None => self.let_go(),
         }
     }
 
@@ -259,13 +261,18 @@ mod tests {
     }
 
     #[test]
-    fn a_coast_caught_and_let_go_adds_nothing() {
+    fn a_coast_caught_then_let_go_or_ended_adds_nothing() {
         let mut kinetic = Kinetic::default();
         let start = Instant::now();
         flick(&mut kinetic, 160, start);
         kinetic.catch(start);
         kinetic.let_go();
         let speed = flick(&mut kinetic, 60_160, start + Duration::from_secs(60));
+        assert_eq!(speed, Some(2000.));
+        // Caught, then ended by a wheel or a click: forgotten as well.
+        kinetic.catch(start + Duration::from_secs(60));
+        kinetic.end();
+        let speed = flick(&mut kinetic, 120_160, start + Duration::from_secs(120));
         assert_eq!(speed, Some(2000.));
     }
 
