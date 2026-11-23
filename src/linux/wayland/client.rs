@@ -45,7 +45,7 @@ use wayland_protocols::ext::background_effect::v1::client::{
     ext_background_effect_manager_v1, ext_background_effect_surface_v1,
 };
 use wayland_protocols::wp::pointer_gestures::zv1::client::{
-    zwp_pointer_gesture_pinch_v1, zwp_pointer_gestures_v1,
+    zwp_pointer_gesture_hold_v1, zwp_pointer_gesture_pinch_v1, zwp_pointer_gestures_v1,
 };
 use wayland_protocols::wp::primary_selection::zv1::client::zwp_primary_selection_offer_v1::{
     self, ZwpPrimarySelectionOfferV1,
@@ -84,6 +84,7 @@ use xkbcommon::xkb::{self, KEYMAP_COMPILE_NO_FLAGS, Keycode};
 
 use super::{
     display::{WaylandDisplay, refresh_interval_from_millihertz},
+    kinetic::Kinetic,
     window::{ImeInput, WaylandWindowStatePtr},
 };
 
@@ -401,6 +402,19 @@ pub(crate) struct WaylandClientState {
     vertical_modifier: f32,
     horizontal_modifier: f32,
     scroll_event_received: bool,
+    // Ritornel: a touchpad's scroll phases and its coast (`kinetic.rs`):
+    // this pointer frame's source, the axes (vertical, horizontal) it
+    // scrolled and when, and its last lift; whether fingers are scrolling,
+    // on which axes; and the window a coast scrolls.
+    hold_gesture: Option<zwp_pointer_gesture_hold_v1::ZwpPointerGestureHoldV1>,
+    kinetic: Kinetic,
+    frame_axis_source: Option<AxisSource>,
+    frame_axes: [bool; 2],
+    frame_axis_time: Option<u32>,
+    axis_stop_time: Option<u32>,
+    finger_scrolling: bool,
+    finger_axes: [bool; 2],
+    coast_window: Option<WaylandWindowStatePtr>,
     enter_token: Option<()>,
     button_pressed: Option<MouseButton>,
     mouse_focused_window: Option<WaylandWindowStatePtr>,
@@ -560,6 +574,32 @@ pub(crate) enum PendingActivation {
 }
 
 impl WaylandClientState {
+    // Ritornel: fingers resting on the touchpad or a new scroll catch a
+    // coast, and a flick that follows may add the speed it had.
+    fn catch_coast(&mut self) {
+        self.kinetic.catch(Instant::now());
+        self.coast_window = None;
+    }
+
+    // Ritornel: a click or a pinch ends a coast.
+    fn end_coast(&mut self) {
+        self.kinetic.end();
+        self.coast_window = None;
+    }
+
+    // Ritornel: the pointer leaving, its window closing or a new pointer
+    // forget the touchpad's scroll altogether.
+    fn forget_scroll(&mut self) {
+        self.kinetic = Kinetic::default();
+        self.frame_axis_source = None;
+        self.frame_axes = [false; 2];
+        self.frame_axis_time = None;
+        self.axis_stop_time = None;
+        self.finger_scrolling = false;
+        self.finger_axes = [false; 2];
+        self.coast_window = None;
+    }
+
     fn consume_startup_activation_token(&mut self, surface: &wl_surface::WlSurface) {
         let Some(startup_activation_token) = self.startup_activation_token.take() else {
             return;
@@ -806,6 +846,15 @@ impl WaylandClientStatePtr {
         let client = self.get_client();
         let mut state = client.borrow_mut();
         let closed_window = state.windows.remove(surface_id).unwrap();
+        // Ritornel: a touchpad's scroll over the closed window, or its
+        // coast, ends with it.
+        if [&state.mouse_focused_window, &state.coast_window]
+            .into_iter()
+            .flatten()
+            .any(|window| window.ptr_eq(&closed_window))
+        {
+            state.forget_scroll();
+        }
         if let Some(window) = state.mouse_focused_window.take()
             && !window.ptr_eq(&closed_window)
         {
@@ -1118,6 +1167,15 @@ impl WaylandConnection {
             },
             capslock: Capslock { on: false },
             scroll_event_received: false,
+            hold_gesture: None,
+            kinetic: Kinetic::default(),
+            frame_axis_source: None,
+            frame_axes: [false; 2],
+            frame_axis_time: None,
+            axis_stop_time: None,
+            finger_scrolling: false,
+            finger_axes: [false; 2],
+            coast_window: None,
             axis_source: AxisSource::Wheel,
             mouse_location: None,
             continuous_scroll_delta: None,
@@ -1695,11 +1753,41 @@ impl Dispatch<WlCallback, ObjectId> for WaylandClientStatePtr {
         let Some(window) = get_window(&mut state, surface_id) else {
             return;
         };
+        // Ritornel: a coast moves its window's page a step each frame, where
+        // the pointer is now, and has the window draw the next one while it
+        // goes on.
+        let mut coast = None;
+        if let wl_callback::Event::Done { .. } = event
+            && state
+                .coast_window
+                .as_ref()
+                .is_some_and(|coasting| coasting.ptr_eq(&window))
+            && let Some(position) = state.mouse_location
+            && let Some((delta, going)) = state.kinetic.step(Instant::now())
+        {
+            if !going {
+                state.coast_window = None;
+            }
+            let input = PlatformInput::Scroll(ScrollEvent {
+                position,
+                delta: ScrollDelta::Pixels(point(px(delta[0] as f32), px(delta[1] as f32))),
+                modifiers: state.modifiers,
+                touch_phase: TouchPhase::Moved,
+                source: ScrollSource::Pointer,
+            });
+            coast = Some((input, going));
+        }
         drop(state);
 
         // The callback's timestamp uses a clock the protocol leaves unspecified,
         // so frame timing measures from receipt, as the other platforms do.
         if let wl_callback::Event::Done { .. } = event {
+            if let Some((input, going)) = coast {
+                window.handle_input(input);
+                if going {
+                    window.request_redraw();
+                }
+            }
             window.frame_callback_fired(PlatformFrameSignal::capture(Instant::now));
         }
     }
@@ -1999,6 +2087,19 @@ impl Dispatch<wl_seat::WlSeat, ()> for WaylandClientStatePtr {
                         gesture_manager.get_pinch_gesture(&pointer, qh, ())
                     },
                 );
+
+                // Ritornel: the hold gesture, new in version 3, says when
+                // fingers rest on the touchpad.
+                state.forget_scroll();
+                if let Some(hold_gesture) = state.hold_gesture.take() {
+                    hold_gesture.destroy();
+                }
+                state.hold_gesture = state
+                    .globals
+                    .gesture_manager
+                    .as_ref()
+                    .filter(|gesture_manager| gesture_manager.version() >= 3)
+                    .map(|gesture_manager| gesture_manager.get_hold_gesture(&pointer, qh, ()));
 
                 if let Some(wl_pointer) = &state.wl_pointer {
                     wl_pointer.release();
@@ -2416,6 +2517,7 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandClientStatePtr {
                 }
             }
             wl_pointer::Event::Leave { .. } => {
+                state.forget_scroll();
                 if let Some(focused_window) = state.mouse_focused_window.clone() {
                     let input = PlatformInput::MouseExited(MouseExitEvent {
                         position: state.mouse_location.unwrap(),
@@ -2504,6 +2606,9 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandClientStatePtr {
                         focused_surface,
                     );
                 }
+                if button_state == wl_pointer::ButtonState::Pressed {
+                    state.end_coast();
+                }
                 let button = linux_button_to_gpui(button);
                 let Some(button) = button else { return };
                 if state.mouse_focused_window.is_none() {
@@ -2586,15 +2691,21 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandClientStatePtr {
                 axis_source: WEnum::Value(axis_source),
             } => {
                 state.axis_source = axis_source;
+                // Ritornel: the source of this frame's scroll alone.
+                state.frame_axis_source = Some(axis_source);
             }
             wl_pointer::Event::Axis {
+                time,
                 axis: WEnum::Value(axis),
                 value,
-                ..
             } => {
                 if state.axis_source == AxisSource::Wheel {
                     return;
                 }
+                // Ritornel: whether it is a touchpad's is known at the
+                // frame's end, which its source may come just before.
+                state.frame_axis_time = Some(time);
+                state.frame_axes[usize::from(axis == wl_pointer::Axis::HorizontalScroll)] = true;
                 let axis = if state.modifiers.shift {
                     wl_pointer::Axis::HorizontalScroll
                 } else {
@@ -2675,35 +2786,92 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandClientStatePtr {
                     _ => unreachable!(),
                 }
             }
+            // Ritornel: the fingers stopped moving on one axis, which the
+            // other may go on scrolling.
+            wl_pointer::Event::AxisStop {
+                time,
+                axis: WEnum::Value(axis),
+            } => {
+                let moving =
+                    &mut state.finger_axes[usize::from(axis == wl_pointer::Axis::HorizontalScroll)];
+                if std::mem::take(moving) {
+                    state.axis_stop_time = Some(time);
+                    state.scroll_event_received = true;
+                }
+            }
             wl_pointer::Event::Frame => {
+                // Ritornel: a touchpad's scroll is the frame's if its source
+                // says so, and its axes join the fingers'.
+                let finger = state.frame_axis_source.take() == Some(AxisSource::Finger);
+                let frame_axes = std::mem::take(&mut state.frame_axes);
+                let frame_axis_time = state.frame_axis_time.take();
+                let finger_time = frame_axis_time.filter(|_| finger);
+                if finger {
+                    for (moving, scrolled) in state.finger_axes.iter_mut().zip(frame_axes) {
+                        *moving |= scrolled;
+                    }
+                }
                 if state.scroll_event_received {
                     state.scroll_event_received = false;
                     let continuous = state.continuous_scroll_delta.take();
                     let discrete = state.discrete_scroll_delta.take();
+                    // Ritornel: a touchpad's scroll is Started, Moved and
+                    // Ended, as on macOS, and coasts after it ends, as its
+                    // momentum does there.
+                    let stop_time = state.axis_stop_time.take();
+                    if continuous.is_some() || discrete.is_some() {
+                        state.catch_coast();
+                    }
+                    let mut deltas = Vec::new();
                     if let Some(continuous) = continuous {
-                        if let Some(window) = state.mouse_focused_window.clone() {
-                            let input = PlatformInput::Scroll(ScrollEvent {
-                                position: state.mouse_location.unwrap(),
-                                delta: ScrollDelta::Pixels(continuous),
-                                modifiers: state.modifiers,
-                                touch_phase: TouchPhase::Moved,
-                                source: ScrollSource::Pointer,
-                            });
-                            drop(state);
-                            window.handle_input(input);
-                        }
-                    } else if let Some(discrete) = discrete
-                        && let Some(window) = state.mouse_focused_window.clone()
+                        let touch_phase = match finger_time {
+                            Some(time) => {
+                                state.kinetic.scroll(
+                                    time,
+                                    [f64::from(continuous.x), f64::from(continuous.y)],
+                                );
+                                if std::mem::replace(&mut state.finger_scrolling, true) {
+                                    TouchPhase::Moved
+                                } else {
+                                    TouchPhase::Started
+                                }
+                            }
+                            None => TouchPhase::Moved,
+                        };
+                        deltas.push((ScrollDelta::Pixels(continuous), touch_phase));
+                    } else if let Some(discrete) = discrete {
+                        deltas.push((ScrollDelta::Lines(discrete), TouchPhase::Moved));
+                    }
+                    // The fingers lifted once neither axis moves.
+                    let mut coasts = false;
+                    if let Some(time) = stop_time
+                        && state.finger_axes == [false; 2]
+                        && std::mem::take(&mut state.finger_scrolling)
                     {
-                        let input = PlatformInput::Scroll(ScrollEvent {
-                            position: state.mouse_location.unwrap(),
-                            delta: ScrollDelta::Lines(discrete),
-                            modifiers: state.modifiers,
-                            touch_phase: TouchPhase::Moved,
+                        deltas.push((ScrollDelta::Pixels(Point::default()), TouchPhase::Ended));
+                        coasts = state.kinetic.lift(time, Instant::now());
+                    }
+                    let Some(window) = state.mouse_focused_window.clone() else {
+                        state.forget_scroll();
+                        return;
+                    };
+                    let position = state.mouse_location.unwrap();
+                    let modifiers = state.modifiers;
+                    if coasts {
+                        state.coast_window = Some(window.clone());
+                    }
+                    drop(state);
+                    for (delta, touch_phase) in deltas {
+                        window.handle_input(PlatformInput::Scroll(ScrollEvent {
+                            position,
+                            delta,
+                            modifiers,
+                            touch_phase,
                             source: ScrollSource::Pointer,
-                        });
-                        drop(state);
-                        window.handle_input(input);
+                        }));
+                    }
+                    if coasts {
+                        window.request_redraw();
                     }
                 }
             }
@@ -2722,6 +2890,27 @@ impl Dispatch<zwp_pointer_gestures_v1::ZwpPointerGesturesV1, ()> for WaylandClie
         _: &QueueHandle<Self>,
     ) {
         // The gesture manager doesn't generate events
+    }
+}
+
+// Ritornel: fingers resting on the touchpad catch a coast, and lifting
+// without scrolling lets it go.
+impl Dispatch<zwp_pointer_gesture_hold_v1::ZwpPointerGestureHoldV1, ()> for WaylandClientStatePtr {
+    fn event(
+        this: &mut Self,
+        _: &zwp_pointer_gesture_hold_v1::ZwpPointerGestureHoldV1,
+        event: <zwp_pointer_gesture_hold_v1::ZwpPointerGestureHoldV1 as Proxy>::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        let client = this.get_client();
+        let mut state = client.borrow_mut();
+        match event {
+            zwp_pointer_gesture_hold_v1::Event::Begin { .. } => state.catch_coast(),
+            zwp_pointer_gesture_hold_v1::Event::End { cancelled: 0, .. } => state.kinetic.let_go(),
+            _ => {}
+        }
     }
 }
 
@@ -2752,6 +2941,7 @@ impl Dispatch<zwp_pointer_gesture_pinch_v1::ZwpPointerGesturePinchV1, ()>
                 surface: _,
                 fingers: _,
             } => {
+                state.end_coast();
                 state.pinch_scale = 1.0;
                 let input = PlatformInput::Pinch(PinchEvent {
                     position: state.mouse_location.unwrap_or(point(px(0.0), px(0.0))),

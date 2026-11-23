@@ -1064,7 +1064,8 @@ impl WaylandWindowStatePtr {
         }
     }
 
-    fn request_redraw(&self) {
+    // Ritornel: public in the crate, for a coast (`client.rs`).
+    pub(crate) fn request_redraw(&self) {
         self.state.borrow_mut().redraw_requested = true;
         self.schedule_frame();
     }
