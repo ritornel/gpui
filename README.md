@@ -13,7 +13,7 @@ GPUI's Wayland backend ignores a touchpad's `axis_stop`, so its scroll events ca
 - The coast follows the numbers GTK 4 (4.20) uses in `GtkScrolledWindow`: the speed over the last 150 ms before the lift, slowing at a rate of 4 a second until below 0.1 px/s. A flick that catches a coast, the same way and at least a third as fast, adds up to six times that coast's speed. `kinetic.rs` is written from GTK's behaviour, not from its code. Distances stay GPUI's, 3 pixels for each unit a touchpad scrolls where GTK moves 2.5, so a flick goes as far, for the scroll that threw it, as in GTK.
 - Fingers resting on the touchpad (the pointer gestures protocol's hold gesture, from its version 3) or a new scroll catch a coast, and fingers that lift without scrolling let it go. A click or a pinch ends it. The pointer leaving, the window under it or coasting closing, or a new pointer forget the scroll altogether.
 
-The patch is two commits on each patched branch: `kinetic.rs`, then the changes to the published files, each marked `// Ritornel:`.
+The patch starts as two commits on each patched branch, `kinetic.rs` and then the changes to the published files, each marked `// Ritornel:`. Fixes follow as commits of their own.
 
 ## Branches and tags
 
@@ -33,7 +33,7 @@ When crates.io has a newer release, a scheduled workflow opens an issue here. On
 scripts/sync.sh 0.3.14
 ```
 
-It downloads the release and checks it against the checksum crates.io gives. It commits it on `upstream`, tagged `upstream/v0.3.14`, and makes `patched/v0.3.14` from that tag with the newest patched branch's commits cherry-picked onto it. Then it checks the patched files' formatting, runs `kinetic.rs`'s tests, and tags the result `patched/v0.3.14-1`. It works in temporary worktrees, pushes nothing, and ends by printing the push and the commit for Ritornel to pin. A conflict stops it, leaving the worktree to finish the cherry-pick in. After a manual finish, check and tag as the script's last step does:
+It downloads the release and checks it against the checksum crates.io gives. It commits it on `upstream`, tagged `upstream/v0.3.14`, and makes `patched/v0.3.14` from that tag with the newest patched branch's commits cherry-picked onto it. Then it checks the patched files' formatting, runs `kinetic.rs`'s tests, and tags the result `patched/v0.3.14-1`. It works in temporary worktrees, pushes nothing, and ends by printing the push, atomic so that the four refs arrive together, and the commit for Ritornel to pin. Run again after a failure, it goes on from what the last run finished. A conflict stops it, leaving the worktree to finish the cherry-pick in. After a manual finish, check and tag as the script's last step does:
 
 ```sh
 git diff --name-only -z upstream/v0.3.14 HEAD -- '*.rs' | xargs -0 rustfmt --edition 2024 --check

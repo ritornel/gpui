@@ -8,6 +8,11 @@ on:
 permissions:
   contents: read
   issues: write
+# One check at a time, so that two cannot both open the issue.
+concurrency: upstream
+defaults:
+  run:
+    shell: bash
 jobs:
   check:
     runs-on: ubuntu-latest
@@ -23,7 +28,8 @@ jobs:
           echo "crates.io has $latest; the newest here is upstream/v$ours"
           [[ $(printf '%s\n' "$ours" "$latest" | sort -V | tail -n1) != "$ours" ]] || exit 0
           title="gpui-pre-linux $latest is out"
-          open=$(gh issue list -R "$GITHUB_REPOSITORY" --state open --search "\"$title\" in:title" --json number --jq length)
+          open=$(gh api --paginate "repos/$GITHUB_REPOSITORY/issues?state=open&per_page=100" \
+            --jq "[.[] | select(.title == \"$title\")] | length" | awk '{n += $1} END {print n + 0}')
           [[ $open == 0 ]] || exit 0
           gh issue create -R "$GITHUB_REPOSITORY" --title "$title" \
             --body "crates.io has gpui-pre-linux $latest, and the newest here is upstream/v$ours. On main, run \`scripts/sync.sh $latest\` (README.md, \"Syncing\")."

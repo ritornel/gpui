@@ -11,6 +11,10 @@ on:
   workflow_dispatch:
 permissions:
   contents: read
+# bash with pipefail, so that a pipe fails when any part of it does.
+defaults:
+  run:
+    shell: bash
 jobs:
   branches:
     runs-on: ubuntu-latest
