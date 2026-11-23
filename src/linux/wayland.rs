@@ -2,6 +2,8 @@ mod client;
 mod clipboard;
 mod cursor;
 mod display;
+// Ritornel: kinetic scrolling for a touchpad.
+mod kinetic;
 mod popup;
 mod serial;
 mod window;
