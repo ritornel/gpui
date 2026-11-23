@@ -1,0 +1,29 @@
+# Opens an issue here when crates.io has a gpui-pre-linux newer than the
+# newest upstream/v* tag, saying to run scripts/sync.sh.
+name: upstream
+on:
+  schedule:
+    - cron: "41 7 * * *"
+  workflow_dispatch:
+permissions:
+  contents: read
+  issues: write
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          latest=$(curl -fsSL -A "ritornel-gpui-sync (https://github.com/ritornel/gpui)" \
+            https://crates.io/api/v1/crates/gpui-pre-linux | jq -er .crate.max_stable_version)
+          ours=$(git ls-remote --tags "https://github.com/$GITHUB_REPOSITORY" 'refs/tags/upstream/v*' |
+            sed -n 's|.*refs/tags/upstream/v\([^^]*\)$|\1|p' | sort -V | tail -n1)
+          echo "crates.io has $latest; the newest here is upstream/v$ours"
+          [[ $(printf '%s\n' "$ours" "$latest" | sort -V | tail -n1) != "$ours" ]] || exit 0
+          title="gpui-pre-linux $latest is out"
+          open=$(gh issue list -R "$GITHUB_REPOSITORY" --state open --search "\"$title\" in:title" --json number --jq length)
+          [[ $open == 0 ]] || exit 0
+          gh issue create -R "$GITHUB_REPOSITORY" --title "$title" \
+            --body "crates.io has gpui-pre-linux $latest, and the newest here is upstream/v$ours. On main, run \`scripts/sync.sh $latest\` (README.md, \"Syncing\")."

@@ -1,0 +1,48 @@
+# Tests every patched/* branch. A workflow on a patched branch would be a
+# change to the crate, so this one, on main, checks each branch out: when
+# main changes, every day, and on demand (`gh workflow run patched.yml`,
+# as scripts/sync.sh says after a sync).
+name: patched
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  branches:
+    runs-on: ubuntu-latest
+    outputs:
+      branches: ${{ steps.list.outputs.branches }}
+    steps:
+      - id: list
+        run: |
+          branches=$(git ls-remote --heads "https://github.com/$GITHUB_REPOSITORY" 'refs/heads/patched/*' |
+            cut -f2 | sed 's|^refs/heads/||' | jq -Rnc '[inputs]')
+          echo "branches=$branches" >>"$GITHUB_OUTPUT"
+  test:
+    needs: branches
+    if: needs.branches.outputs.branches != '[]'
+    strategy:
+      fail-fast: false
+      matrix:
+        branch: ${{ fromJSON(needs.branches.outputs.branches) }}
+    name: ${{ matrix.branch }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ matrix.branch }}
+          fetch-depth: 0
+          fetch-tags: true
+      - run: rustc --version
+      - name: Formatting of the files the patch changes
+        env:
+          BRANCH: ${{ matrix.branch }}
+        run: git diff --name-only -z "upstream/v${BRANCH#patched/v}" HEAD -- '*.rs' | xargs -0 rustfmt --edition 2024 --check
+      - name: kinetic.rs's tests
+        run: |
+          rustc --edition 2024 --test -D warnings -o "$RUNNER_TEMP/kinetic" src/linux/wayland/kinetic.rs
+          "$RUNNER_TEMP/kinetic"
